@@ -194,6 +194,7 @@ func (proxy *Proxy) onDisconnect(conn redcon.Conn, err error) {
 func (proxy *Proxy) onCommand(conn redcon.Conn, cmd redcon.Command) {
 	switch strings.ToLower(string(cmd.Args[0])) {
 	default:
+		log.Printf("Unknown command %s", cmd.Args[0])
 		conn.WriteError("ERR unknown command '" + string(cmd.Args[0]) + "'")
 	case "ping":
 		conn.WriteString("PONG")
