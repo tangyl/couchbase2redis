@@ -161,6 +161,11 @@ func (proxy *Proxy) expire(key []byte, expire uint32) error {
 	return err
 }
 
+func (proxy *Proxy) ttl(key []byte, expire uint32) error {
+	_, err := proxy.bucket.Touch(string(key), 0, expire)
+	return err
+}
+
 func (proxy *Proxy) set(key []byte, value []byte, expire uint32) error {
 	var js interface{}
 	var err error
@@ -318,7 +323,7 @@ func (proxy *Proxy) onCommand(conn redcon.Conn, cmd redcon.Command) {
 			conn.WriteError(fmt.Sprintf("ERR invalid expire format %s", string(cmd.Args[2])))
 			return
 		}
-		proxy.expire(cmd.Args[1], uint32(val))
+		proxy.ttl(cmd.Args[1], uint32(val))
 		conn.WriteString("OK")
 
 	case "pttl":
@@ -331,7 +336,7 @@ func (proxy *Proxy) onCommand(conn redcon.Conn, cmd redcon.Command) {
 			conn.WriteError(fmt.Sprintf("ERR invalid expire format %s", string(cmd.Args[2])))
 			return
 		}
-		proxy.expire(cmd.Args[1], uint32(val))
+		proxy.ttl(cmd.Args[1], uint32(val/1000))
 		conn.WriteString("OK")
 	}
 
