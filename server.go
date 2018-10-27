@@ -149,11 +149,11 @@ func ttl(expire uint32) uint32 {
 		return 0
 	}
 
-	if expire <= (30 * 24 * 60 * 60) {
-		return uint32(time.Now().Unix() + int64(expire))
-	}
+	// if expire <= (30 * 24 * 60 * 60) {
+        //	return uint32(time.Now().Unix() + int64(expire))
+	//}
 
-	return expire
+        return uint32(time.Now().Unix() + int64(expire))
 }
 
 func (proxy *Proxy) expire(key []byte, expire uint32) error {
