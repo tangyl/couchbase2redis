@@ -50,27 +50,6 @@ func NewProxy(listen string, couchbase string, user string, password string, buc
 		log.Printf("cache enabled with TTL=%s", ttl)
 
 		cache = gocache.New(ttl, ttl)
-
-		/*
-			ttl := time.Duration(cacheTTL) * time.Second
-
-			config := bigcache.Config{
-				Shards:             1024,
-				LifeWindow:         ttl,
-				MaxEntriesInWindow: 100 * cacheTTL,
-				MaxEntrySize:       1024,
-				Verbose:            true,
-				HardMaxCacheSize:   4096,
-				OnRemove:           nil,
-				OnRemoveWithReason: nil}
-
-			cache, _ = bigcache.NewBigCache(config)
-
-			if err != nil {
-				log.Printf("init bigcache failed")
-				return nil, err
-			}
-		*/
 	}
 
 	return &Proxy{bucket: bkt, listen: listen, cache: cache}, nil
@@ -80,28 +59,6 @@ func (proxy *Proxy) get(key []byte) ([]byte, bool, error) {
 	if proxy.cache == nil {
 		return proxy.rawGet(key)
 	}
-
-	/*
-		bytes, err := proxy.cache.Get(string(key))
-
-		if err != nil {
-			if _, ok := err.(*bigcache.EntryNotFoundError); ok {
-				rawBytes, succ, err := proxy.rawGet(key)
-				if err == nil && succ {
-					proxy.cache.Set(string(key), rawBytes)
-				} else if err == nil {
-					proxy.cache.Set(string(key), nil)
-				}
-				return rawBytes, succ, err
-			}
-			return nil, false, err
-		}
-
-		if bytes != nil {
-			return bytes, true, nil
-		}
-		return nil, false, nil
-	*/
 
 	val, found := proxy.cache.Get(string(key))
 
@@ -124,7 +81,6 @@ func (proxy *Proxy) get(key []byte) ([]byte, bool, error) {
 	}
 
 	return nil, false, nil
-
 }
 
 func (proxy *Proxy) rawGet(key []byte) ([]byte, bool, error) {
@@ -144,16 +100,147 @@ func (proxy *Proxy) rawGet(key []byte) ([]byte, bool, error) {
 	return bytes, true, nil
 }
 
+func (proxy *Proxy) mset(kvs [][]byte) error {
+	if len(kvs)%2 != 0 {
+		return fmt.Errorf("mset error: odd length")
+	}
+
+	if proxy.cache == nil {
+		return proxy.rawMSet(kvs)
+	}
+
+	for i := 0; i < len(kvs)/2; i++ {
+		key := kvs[i*2]
+		val := kvs[i*2+1]
+		proxy.cache.Set(string(key), val, gocache.DefaultExpiration)
+	}
+
+	return proxy.rawMSet(kvs)
+}
+
+func (proxy *Proxy) rawMSet(kvs [][]byte) error {
+	if len(kvs)%2 != 0 {
+		return fmt.Errorf("mset error: odd length")
+	}
+
+	upsertOps := make([]gocb.UpsertOp, len(kvs)/2)
+	bulkOps := make([]gocb.BulkOp, len(kvs)/2)
+
+	for i := 0; i < len(kvs)/2; i++ {
+		var js interface{}
+		var err error
+		err = json.Unmarshal(kvs[i*2+1], &js)
+		if err != nil {
+			return fmt.Errorf("mset error: key %s unmarshal error: %s", string(kvs[i*2]), err)
+		}
+
+		upsertOps[i] = gocb.UpsertOp{Key: string(kvs[i*2]), Value: js}
+		bulkOps[i] = &upsertOps[i]
+	}
+
+	err := proxy.bucket.Do(bulkOps)
+
+	for i := range upsertOps {
+		if upsertOps[i].Err != nil {
+			log.Printf("mset error: key %s upsert error: %s", upsertOps[i].Key, upsertOps[i].Err)
+		}
+	}
+
+	return err
+}
+
+func (proxy *Proxy) mget(keys [][]byte) ([][]byte, error) {
+	if proxy.cache == nil {
+		return proxy.rawMGet(keys)
+	}
+
+	result := make([][]byte, len(keys))
+	var missed = []int{}
+	var missedKeys = [][]byte{}
+	for i := range keys {
+		val, found := proxy.cache.Get(string(keys[i]))
+		if !found {
+			missed = append(missed, i)
+			missedKeys = append(missedKeys, keys[i])
+		} else {
+			if bytes, ok := val.([]byte); ok {
+				result[i] = bytes
+			} else {
+				result[i] = nil
+			}
+		}
+	}
+	if len(missed) > 0 {
+		missedResult, err := proxy.rawMGet(missedKeys)
+		if err != nil {
+			log.Printf("mget error: %s", err)
+			return nil, err
+		}
+		for k := range missed {
+			if missedResult[k] == nil {
+				proxy.cache.Set(string(missedKeys[k]), 0, gocache.DefaultExpiration)
+			} else {
+				proxy.cache.Set(string(missedKeys[k]), missedResult[k], gocache.DefaultExpiration)
+			}
+			result[missed[k]] = missedResult[k]
+		}
+	}
+	return result, nil
+}
+
+func (proxy *Proxy) rawMGet(keys [][]byte) ([][]byte, error) {
+	getOps := make([]gocb.GetOp, len(keys))
+	bulkOps := make([]gocb.BulkOp, len(keys))
+	for i := range keys {
+		var val interface{}
+		getOps[i] = gocb.GetOp{Key: string(keys[i]), Value: &val}
+		bulkOps[i] = &getOps[i]
+	}
+
+	err := proxy.bucket.Do(bulkOps)
+	if err != nil {
+		log.Printf("rawMGet failed: %s", err)
+		return nil, err
+	}
+
+	var result = make([][]byte, len(getOps))
+
+	for i := range getOps {
+		item := getOps[i]
+		if item.Err != nil {
+			if gocb.IsKeyNotFoundError(item.Err) {
+				result[i] = nil
+			} else {
+				log.Printf("mget error: %s get item error: %s", item.Key, item.Err)
+				result[i] = nil
+			}
+		} else {
+			if item.Value == nil {
+				result[i] = nil
+			} else {
+				bytes, err := json.Marshal(item.Value)
+				if err != nil {
+					log.Printf("mget error: unable to marshal key %s: %s", item.Key, item.Err)
+					result[i] = nil
+				}
+				result[i] = bytes
+			}
+		}
+	}
+
+	return result, nil
+}
+
 func ttl(expire uint32) uint32 {
 	if expire == 0 {
 		return 0
 	}
 
 	// if expire <= (30 * 24 * 60 * 60) {
-        //	return uint32(time.Now().Unix() + int64(expire))
+	//	return uint32(time.Now().Unix() + int64(expire))
 	//}
 
-        return uint32(time.Now().Unix() + int64(expire))
+	return uint32(time.Now().Unix() + int64(expire))
 }
 
 func (proxy *Proxy) expire(key []byte, expire uint32) error {
@@ -177,7 +264,15 @@ func (proxy *Proxy) set(key []byte, value []byte, expire uint32) error {
 
 	// log.Printf("set %s with ttl %d", key, ttl(expire))
 	_, err = proxy.bucket.Upsert(string(key), js, ttl(expire))
-	return err
+
+	if err != nil {
+		return err
+	}
+
+	if proxy.cache != nil {
+		proxy.cache.Set(string(key), value, gocache.DefaultExpiration)
+	}
+	return nil
 }
 
 func (proxy *Proxy) remove(key []byte) bool {
@@ -185,15 +280,69 @@ func (proxy *Proxy) remove(key []byte) bool {
 	if err != nil {
 		return false
 	}
+
+	if proxy.cache != nil {
+		proxy.cache.Delete(string(key))
+	}
 	return true
 }
 
+func (proxy *Proxy) rawMDel(keys [][]byte) (int, error) {
+	delOps := make([]gocb.RemoveOp, len(keys))
+	bulkOps := make([]gocb.BulkOp, len(keys))
+
+	for i := 0; i < len(keys); i++ {
+		delOps[i] = gocb.RemoveOp{Key: string(keys[i])}
+		bulkOps[i] = &delOps[i]
+	}
+
+	err := proxy.bucket.Do(bulkOps)
+
+	if err != nil {
+		log.Printf("mdel error: %s", err)
+		return 0, err
+	}
+
+	var ret int = 0
+
+	for i := range delOps {
+		if delOps[i].Err != nil {
+			if gocb.IsKeyNotFoundError(delOps[i].Err) {
+				// pass
+			} else {
+				log.Printf("mset error: key %s upsert error: %s", delOps[i].Key, delOps[i].Err)
+			}
+		} else {
+			ret++
+		}
+	}
+
+	return ret, nil
+}
+
+func (proxy *Proxy) mdel(keys [][]byte) (int, error) {
+
+	ret, err := proxy.rawMDel(keys)
+	if err != nil {
+		return ret, err
+	}
+
+	if proxy.cache != nil {
+		for i := range keys {
+			proxy.cache.Delete(string(keys[i]))
+		}
+	}
+
+	return ret, nil
+}
+
 func (proxy *Proxy) onConnect(conn redcon.Conn) bool {
+	log.Printf("client %s connected", conn.RemoteAddr())
 	return true
 }
 
 func (proxy *Proxy) onDisconnect(conn redcon.Conn, err error) {
-
+	log.Printf("client %s disconnected", conn.RemoteAddr())
 }
 
 func (proxy *Proxy) onCommand(conn redcon.Conn, cmd redcon.Command) {
@@ -252,40 +401,47 @@ func (proxy *Proxy) onCommand(conn redcon.Conn, cmd redcon.Command) {
 			conn.WriteError("ERR wrong number of arguments for get'" + string(cmd.Args[0]) + "' command")
 			return
 		}
-		conn.WriteArray(len(cmd.Args) - 1)
+		result, err := proxy.mget(cmd.Args[1:])
+		if err != nil {
+			conn.WriteError(fmt.Sprintf("ERR mget failed: %s", err))
+			return
+		}
 
-		for i := 1; i < len(cmd.Args); i++ {
-			bytes, ok, err := proxy.get(cmd.Args[i])
-			if err != nil {
-				conn.WriteError(fmt.Sprintf("Couchbase report error: %s", err))
-			} else if ok {
+		conn.WriteArray(len(result))
+		for _, bytes := range result {
+			if bytes != nil {
 				conn.WriteBulk(bytes)
 			} else {
 				conn.WriteNull()
 			}
 		}
+
 	case "mset":
 		if len(cmd.Args) < 3 || len(cmd.Args)%2 != 1 {
 			conn.WriteError("ERR wrong number of arguments for mset")
 			return
 		}
 
-		for i := 1; i < len(cmd.Args); i += 2 {
-			proxy.set(cmd.Args[i], cmd.Args[i+1], 0)
+		err := proxy.mset(cmd.Args[1:])
+
+		if err != nil {
+			conn.WriteError(fmt.Sprintf("ERR mset failed: %s", err))
+		} else {
+			conn.WriteString("OK")
 		}
-		conn.WriteString("OK")
 
 	case "del":
-		if len(cmd.Args) != 2 {
+		if len(cmd.Args) < 2 {
 			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 			return
 		}
-		ok := proxy.remove(cmd.Args[1])
-		if !ok {
-			conn.WriteInt(0)
-		} else {
-			conn.WriteInt(1)
+		ret, err := proxy.mdel(cmd.Args[1:])
+		if err != nil {
+			conn.WriteError(fmt.Sprintf("ERR del failed: %s", err))
+			return
 		}
+		conn.WriteInt(ret)
+		return
 
 	case "expire":
 		if len(cmd.Args) != 3 {
