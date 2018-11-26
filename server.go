@@ -336,6 +336,20 @@ func (proxy *Proxy) mdel(keys [][]byte) (int, error) {
 	return ret, nil
 }
 
+func (proxy *Proxy) exists(keys [][]byte) (int, error) {
+	result, err := proxy.mget(keys)
+	if err != nil {
+		return 0, err
+	}
+	var i = 0
+	for _, bytes := range result {
+		if bytes != nil {
+			i = i + 1
+		}
+	}
+	return i, nil
+}
+
 func (proxy *Proxy) onConnect(conn redcon.Conn) bool {
 	log.Printf("client %s connected", conn.RemoteAddr())
 	return true
@@ -443,6 +457,19 @@ func (proxy *Proxy) onCommand(conn redcon.Conn, cmd redcon.Command) {
 		conn.WriteInt(ret)
 		return
 
+	case "exists":
+		if len(cmd.Args) < 2 {
+			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
+			return
+		}
+		ret, err := proxy.exists(cmd.Args[1:])
+		if err != nil {
+			conn.WriteError(fmt.Sprintf("ERR exists failed: %s", err))
+			return
+		}
+		conn.WriteInt(ret)
+		return
+
 	case "expire":
 		if len(cmd.Args) != 3 {
 			conn.WriteError(fmt.Sprintf("ERR wrong number of arguments for %s", string(cmd.Args[0])))
@@ -494,6 +521,7 @@ func (proxy *Proxy) onCommand(conn redcon.Conn, cmd redcon.Command) {
 		}
 		proxy.ttl(cmd.Args[1], uint32(val/1000))
 		conn.WriteString("OK")
+
 	}
 
 }
